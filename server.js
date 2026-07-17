@@ -48,6 +48,7 @@ wss.on('connection', async (ws) => {
     const rawMessages = await redisPub.lrange('messages', 0, 49);
     const messages = rawMessages.map(msg => JSON.parse(msg)).reverse();
     ws.send(JSON.stringify({ type: 'init', messages }));
+    console.log(`📨 Sent ${messages.length} messages to new client`);
   } catch (e) {
     console.error('Failed to fetch history:', e);
   }
@@ -82,4 +83,3 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
 });
-// history enabled
