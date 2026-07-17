@@ -26,29 +26,17 @@ const wss = new WebSocket.Server({ server });
 
 app.use(express.static(__dirname));
 
-// ----- Subscribe to Redis channel for cross‑instance broadcast -----
-const CHANNEL = 'chat:messages';
-
-redisSub.subscribe(CHANNEL);
-redisSub.on('message', (channel, message) => {
-  const msg = JSON.parse(message);
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify({ type: 'message', message: msg }));
-    }
-  });
-});
-
 // ----- WebSocket Logic -----
 wss.on('connection', async (ws) => {
   let username = 'Anonymous';
+  let currentRoom = 'Lobby';
 
-  // Send last 50 messages on connection
+  // Send last 50 messages from the default room
+  const roomKey = `room:Lobby:messages`;
   try {
-    const rawMessages = await redisPub.lrange('messages', 0, 49);
+    const rawMessages = await redisPub.lrange(roomKey, 0, 49);
     const messages = rawMessages.map(msg => JSON.parse(msg)).reverse();
-    ws.send(JSON.stringify({ type: 'init', messages }));
-    console.log(`📨 Sent ${messages.length} messages to new client`);
+    ws.send(JSON.stringify({ type: 'init', messages, room: 'Lobby' }));
   } catch (e) {
     console.error('Failed to fetch history:', e);
   }
@@ -60,19 +48,31 @@ wss.on('connection', async (ws) => {
         username = data.username;
         return;
       }
+      if (data.type === 'join_room') {
+        currentRoom = data.room || 'Lobby';
+        const roomKey = `room:${currentRoom}:messages`;
+        const rawMessages = await redisPub.lrange(roomKey, 0, 49);
+        const messages = rawMessages.map(msg => JSON.parse(msg)).reverse();
+        ws.send(JSON.stringify({ type: 'init', messages, room: currentRoom }));
+        return;
+      }
       if (data.type === 'message') {
         const msg = {
           id: Date.now().toString(),
           username,
           text: data.text,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          room: currentRoom
         };
-        // Store in Redis (persistence)
-        await redisPub.lpush('messages', JSON.stringify(msg));
-        await redisPub.ltrim('messages', 0, 999);
+        const roomKey = `room:${currentRoom}:messages`;
+        await redisPub.lpush(roomKey, JSON.stringify(msg));
+        await redisPub.ltrim(roomKey, 0, 999);
 
-        // Publish to all instances via Redis Pub/Sub
-        await redisPub.publish(CHANNEL, JSON.stringify(msg));
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: 'message', message: msg, room: currentRoom }));
+          }
+        });
       }
     } catch (e) {}
   });
