@@ -4,7 +4,7 @@ const http = require('http');
 const Redis = require('ioredis');
 const path = require('path');
 
-// ----- Redis (with Pub/Sub) -----
+// ----- Redis -----
 const redisPub = new Redis({
   host: 'prime-chamois-162864.upstash.io',
   port: 6379,
@@ -19,26 +19,37 @@ const redisSub = new Redis({
   tls: {}
 });
 
-// ----- Express & WebSocket Server -----
+// ----- Express & WebSocket -----
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 app.use(express.static(__dirname));
 
+// ----- Pub/Sub for cross-instance broadcast -----
+redisSub.subscribe('global');
+redisSub.on('message', (channel, message) => {
+  const msg = JSON.parse(message);
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type: 'message', message: msg, room: msg.room }));
+    }
+  });
+});
+
 // ----- WebSocket Logic -----
 wss.on('connection', async (ws) => {
   let username = 'Anonymous';
   let currentRoom = 'Lobby';
 
-  // Send last 50 messages from the default room
-  const roomKey = `room:Lobby:messages`;
+  // Send last 50 messages from room
+  const roomKey = `room:${currentRoom}:messages`;
   try {
     const rawMessages = await redisPub.lrange(roomKey, 0, 49);
     const messages = rawMessages.map(msg => JSON.parse(msg)).reverse();
-    ws.send(JSON.stringify({ type: 'init', messages, room: 'Lobby' }));
+    ws.send(JSON.stringify({ type: 'init', messages, room: currentRoom }));
   } catch (e) {
-    console.error('Failed to fetch history:', e);
+    console.error('History error:', e);
   }
 
   ws.on('message', async (message) => {
@@ -67,15 +78,27 @@ wss.on('connection', async (ws) => {
         const roomKey = `room:${currentRoom}:messages`;
         await redisPub.lpush(roomKey, JSON.stringify(msg));
         await redisPub.ltrim(roomKey, 0, 999);
-
-        wss.clients.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: 'message', message: msg, room: currentRoom }));
-          }
-        });
+        // Publish to all instances
+        await redisPub.publish('global', JSON.stringify(msg));
       }
     } catch (e) {}
   });
+});
+
+// ----- Sync endpoint for offline messages (optional) -----
+app.post('/sync', express.json(), async (req, res) => {
+  const { messages, room } = req.body;
+  if (!messages || !room) return res.status(400).json({ error: 'Missing data' });
+  try {
+    const roomKey = `room:${room}:messages`;
+    for (const msg of messages) {
+      await redisPub.lpush(roomKey, JSON.stringify(msg));
+      await redisPub.ltrim(roomKey, 0, 999);
+    }
+    res.json({ status: 'synced' });
+  } catch (e) {
+    res.status(500).json({ error: 'Sync failed' });
+  }
 });
 
 // ----- Start Server -----

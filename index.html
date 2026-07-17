@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Indian Messenger</title>
+  <title>Indian Messenger · Offline</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{background:#060B16;color:#fff;font-family:Inter,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;padding:16px}
@@ -21,6 +21,7 @@
     .msg-other{background:#1A2440;align-self:flex-start}
     .msg-you{background:#FF9933;color:#060B16;align-self:flex-end}
     .msg .name{font-size:10px;opacity:0.6;margin-bottom:2px}
+    .msg .status{font-size:8px;opacity:0.4;margin-top:2px}
     .flex{display:flex;gap:8px}
     .input-row{flex:1;padding:12px 16px;border-radius:60px;background:#1A2440;border:1px solid #2A3A5A;color:#fff;outline:none;font-size:14px}
     .input-row:focus{border-color:#FF9933}
@@ -29,6 +30,8 @@
     .hidden{display:none}
     .username-input{width:100%;padding:12px 16px;border-radius:14px;background:#1A2440;border:1px solid #2A3A5A;color:#fff;font-size:14px;margin-top:8px;outline:none}
     .btn-join{width:100%;padding:14px;border-radius:60px;border:none;background:#FF9933;color:#060B16;font-weight:700;font-size:16px;cursor:pointer;margin-top:12px}
+    .offline-badge{display:inline-block;background:#FF4D4D22;border:1px solid #FF4D4D44;padding:2px 12px;border-radius:40px;font-size:10px;color:#FF4D4D;margin-left:8px}
+    .online-badge{display:inline-block;background:#2ECC7122;border:1px solid #2ECC7144;padding:2px 12px;border-radius:40px;font-size:10px;color:#2ECC71;margin-left:8px}
   </style>
 </head>
 <body>
@@ -44,6 +47,7 @@
   <div id="chat" class="hidden">
     <div class="room-bar">
       <span class="room-name" id="roomDisplay">📌 Lobby</span>
+      <span id="onlineStatus" class="online-badge">● Online</span>
       <input id="roomInput" placeholder="Room name" />
       <button id="joinRoomBtn">Join</button>
       <button id="createRoomBtn">Create</button>
@@ -56,7 +60,68 @@
   </div>
 </div>
 <script>
+// ----- IndexedDB Helpers -----
+const DB_NAME = 'IndianMessenger';
+const STORE_NAME = 'messages';
+let db;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveMessageToDB(message) {
+  if (!db) db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const req = store.add({ ...message, synced: false });
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getUnsyncedMessages() {
+  if (!db) db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const req = store.getAll();
+    req.onsuccess = () => resolve(req.result.filter(m => !m.synced));
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function markSynced(id) {
+  if (!db) db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const req = store.get(id);
+    req.onsuccess = () => {
+      const msg = req.result;
+      if (msg) {
+        msg.synced = true;
+        store.put(msg);
+      }
+      resolve();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// ----- Main App -----
 let ws, user, currentRoom = 'Lobby';
+let isOnline = navigator.onLine;
 const loginDiv = document.getElementById('login');
 const chatDiv = document.getElementById('chat');
 const usernameInput = document.getElementById('usernameInput');
@@ -68,46 +133,115 @@ const roomInput = document.getElementById('roomInput');
 const joinRoomBtn = document.getElementById('joinRoomBtn');
 const createRoomBtn = document.getElementById('createRoomBtn');
 const roomDisplay = document.getElementById('roomDisplay');
+const onlineStatus = document.getElementById('onlineStatus');
 
-joinBtn.addEventListener('click', () => {
-  const user = usernameInput.value.trim() || 'Guest';
+function updateOnlineStatus() {
+  isOnline = navigator.onLine;
+  if (isOnline) {
+    onlineStatus.className = 'online-badge';
+    onlineStatus.textContent = '● Online';
+  } else {
+    onlineStatus.className = 'offline-badge';
+    onlineStatus.textContent = '● Offline';
+  }
+}
+
+window.addEventListener('online', updateOnlineStatus);
+window.addEventListener('offline', updateOnlineStatus);
+
+function addMessageToUI(username, text, isYou, status = 'sent') {
+  const div = document.createElement('div');
+  div.className = 'msg ' + (isYou ? 'msg-you' : 'msg-other');
+  div.innerHTML = `<div class="name">${username}</div>${text}<div class="status">${status}</div>`;
+  messagesDiv.appendChild(div);
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+joinBtn.addEventListener('click', async () => {
+  user = usernameInput.value.trim() || 'Guest';
   loginDiv.classList.add('hidden');
   chatDiv.classList.remove('hidden');
+  updateOnlineStatus();
+
+  // Open IndexedDB
+  db = await openDB();
+
+  // Register Service Worker
+  if ('serviceWorker' in navigator) {
+    try {
+      await navigator.serviceWorker.register('/sw.js');
+      console.log('Service Worker registered');
+    } catch (e) {
+      console.warn('SW registration failed', e);
+    }
+  }
+
+  // WebSocket connection
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${protocol}//${window.location.host}`);
   ws.onmessage = (e) => {
     const data = JSON.parse(e.data);
     if (data.type === 'init') {
       messagesDiv.innerHTML = '';
-      data.messages.forEach(msg => addMessage(msg.username, msg.text, msg.username === user));
+      data.messages.forEach(msg => addMessageToUI(msg.username, msg.text, msg.username === user, 'sent'));
       roomDisplay.textContent = '📌 ' + data.room;
       currentRoom = data.room;
     } else if (data.type === 'message') {
       if (data.room === currentRoom) {
-        addMessage(data.message.username, data.message.text, data.message.username === user);
+        addMessageToUI(data.message.username, data.message.text, data.message.username === user, 'sent');
       }
+      // Mark as synced in IndexedDB if it was ours
+      // In a full implementation, we'd track by ID
     }
   };
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'set_username', username: user }));
     ws.send(JSON.stringify({ type: 'join_room', room: 'Lobby' }));
+    // Sync queued messages
+    syncQueuedMessages();
   };
+  ws.onclose = () => {
+    // Auto-reconnect logic
+    setTimeout(() => {
+      // Reconnect
+    }, 2000);
+  };
+
   window.user = user;
+  window.syncQueuedMessages = syncQueuedMessages;
 });
 
-function addMessage(username, text, isYou) {
-  const div = document.createElement('div');
-  div.className = 'msg ' + (isYou ? 'msg-you' : 'msg-other');
-  div.innerHTML = `<div class="name">${username}</div>${text}`;
-  messagesDiv.appendChild(div);
-  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+async function syncQueuedMessages() {
+  if (!isOnline || !ws) return;
+  const unsynced = await getUnsyncedMessages();
+  for (const msg of unsynced) {
+    try {
+      ws.send(JSON.stringify({ type: 'message', text: msg.text }));
+      await markSynced(msg.id);
+      // Update UI status
+    } catch (e) {
+      console.warn('Sync failed', e);
+    }
+  }
 }
 
-sendBtn.addEventListener('click', () => {
+sendBtn.addEventListener('click', async () => {
   const text = msgInput.value.trim();
-  if (!text || !ws) return;
-  ws.send(JSON.stringify({ type: 'message', text }));
+  if (!text) return;
   msgInput.value = '';
+
+  const messageData = { username: user, text, room: currentRoom, timestamp: Date.now() };
+
+  if (!isOnline || !ws) {
+    // Offline: save to IndexedDB and show pending
+    await saveMessageToDB(messageData);
+    addMessageToUI(user, text, true, 'pending');
+    return;
+  }
+
+  // Online: send via WebSocket
+  ws.send(JSON.stringify({ type: 'message', text }));
+  addMessageToUI(user, text, true, 'sent');
 });
 
 msgInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendBtn.click(); });
@@ -129,6 +263,17 @@ createRoomBtn.addEventListener('click', () => {
   roomDisplay.textContent = '📌 ' + room;
   roomInput.value = '';
 });
+
+// Listen for sync messages from Service Worker
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'sync_queued') {
+      if (isOnline && ws && ws.readyState === WebSocket.OPEN) {
+        syncQueuedMessages();
+      }
+    }
+  });
+}
 </script>
 </body>
 </html>
