@@ -40,8 +40,17 @@ redisSub.on('message', (channel, message) => {
 });
 
 // ----- WebSocket Logic -----
-wss.on('connection', (ws) => {
+wss.on('connection', async (ws) => {
   let username = 'Anonymous';
+
+  // Send last 50 messages on connection
+  try {
+    const rawMessages = await redisPub.lrange('messages', 0, 49);
+    const messages = rawMessages.map(msg => JSON.parse(msg)).reverse();
+    ws.send(JSON.stringify({ type: 'init', messages }));
+  } catch (e) {
+    console.error('Failed to fetch history:', e);
+  }
 
   ws.on('message', async (message) => {
     try {
