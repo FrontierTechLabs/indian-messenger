@@ -21,6 +21,8 @@ const redisSub = new Redis({
 
 // ----- Express & WebSocket Server -----
 const app = express();
+const cors = require("cors");
+app.use(cors());
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
