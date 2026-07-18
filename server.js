@@ -4,7 +4,7 @@ const http = require('http');
 const Redis = require('ioredis');
 const path = require('path');
 
-// ----- Redis -----
+// ----- Redis (with Pub/Sub) -----
 const redisPub = new Redis({
   host: 'prime-chamois-162864.upstash.io',
   port: 6379,
@@ -19,90 +19,113 @@ const redisSub = new Redis({
   tls: {}
 });
 
-// ----- Express & WebSocket -----
+// ----- Express & WebSocket Server -----
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+app.use(express.json());
 app.use(express.static(__dirname));
 
-// ----- Pub/Sub for cross-instance broadcast -----
-redisSub.subscribe('global');
+// ----- Pub/Sub for cross‑instance broadcast -----
+const CHANNEL = 'aether:events';
+redisSub.subscribe(CHANNEL);
 redisSub.on('message', (channel, message) => {
-  const msg = JSON.parse(message);
+  const event = JSON.parse(message);
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify({ type: 'message', message: msg, room: msg.room }));
+      client.send(JSON.stringify({ type: 'event', event }));
     }
   });
 });
 
-// ----- WebSocket Logic -----
-wss.on('connection', async (ws) => {
-  let username = 'Anonymous';
-  let currentRoom = 'Lobby';
+// ----- API Endpoints -----
 
-  // Send last 50 messages from room
-  const roomKey = `room:${currentRoom}:messages`;
-  try {
-    const rawMessages = await redisPub.lrange(roomKey, 0, 49);
-    const messages = rawMessages.map(msg => JSON.parse(msg)).reverse();
-    ws.send(JSON.stringify({ type: 'init', messages, room: currentRoom }));
-  } catch (e) {
-    console.error('History error:', e);
+// Create a post
+app.post('/api/posts', async (req, res) => {
+  const { did, text, location } = req.body;
+  if (!did || !text) return res.status(400).json({ error: 'Missing DID or text' });
+
+  const post = {
+    id: Date.now().toString(),
+    did,
+    text,
+    location: location || '',
+    timestamp: Date.now(),
+    likes: 0,
+    replies: 0,
+    parentId: null
+  };
+
+  await redisPub.lpush('aether:posts', JSON.stringify(post));
+  await redisPub.ltrim('aether:posts', 0, 999);
+  await redisPub.publish(CHANNEL, JSON.stringify({ type: 'new_post', post }));
+  res.json(post);
+});
+
+// Get feed (chronological)
+app.get('/api/feed', async (req, res) => {
+  const raw = await redisPub.lrange('aether:posts', 0, 49);
+  const posts = raw.map(p => JSON.parse(p)).reverse();
+  res.json(posts);
+});
+
+// Like a post
+app.post('/api/like', async (req, res) => {
+  const { postId, did } = req.body;
+  if (!postId || !did) return res.status(400).json({ error: 'Missing postId or DID' });
+
+  const raw = await redisPub.lrange('aether:posts', 0, 999);
+  let updated = false;
+  for (const item of raw) {
+    const post = JSON.parse(item);
+    if (post.id === postId) {
+      // In a real system, track per-user likes. For MVP, we just increment.
+      post.likes = (post.likes || 0) + 1;
+      // Remove old and add updated
+      await redisPub.lrem('aether:posts', 0, item);
+      await redisPub.rpush('aether:posts', JSON.stringify(post));
+      updated = true;
+      await redisPub.publish(CHANNEL, JSON.stringify({ type: 'like_update', postId, likes: post.likes }));
+      break;
+    }
   }
+  res.json({ success: updated });
+});
 
+// Reply to a post
+app.post('/api/reply', async (req, res) => {
+  const { parentId, did, text } = req.body;
+  if (!parentId || !did || !text) return res.status(400).json({ error: 'Missing fields' });
+
+  const reply = {
+    id: Date.now().toString(),
+    did,
+    text,
+    timestamp: Date.now(),
+    parentId,
+    likes: 0,
+    replies: 0
+  };
+
+  await redisPub.lpush('aether:posts', JSON.stringify(reply));
+  await redisPub.ltrim('aether:posts', 0, 999);
+  await redisPub.publish(CHANNEL, JSON.stringify({ type: 'new_reply', reply }));
+  res.json(reply);
+});
+
+// ----- WebSocket Logic (for real‑time updates) -----
+wss.on('connection', (ws) => {
   ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message);
-      if (data.type === 'set_username') {
-        username = data.username;
-        return;
-      }
-      if (data.type === 'join_room') {
-        currentRoom = data.room || 'Lobby';
-        const roomKey = `room:${currentRoom}:messages`;
-        const rawMessages = await redisPub.lrange(roomKey, 0, 49);
-        const messages = rawMessages.map(msg => JSON.parse(msg)).reverse();
-        ws.send(JSON.stringify({ type: 'init', messages, room: currentRoom }));
-        return;
-      }
-      if (data.type === 'message') {
-        const msg = {
-          id: Date.now().toString(),
-          username,
-          text: data.text,
-          timestamp: Date.now(),
-          room: currentRoom
-        };
-        const roomKey = `room:${currentRoom}:messages`;
-        await redisPub.lpush(roomKey, JSON.stringify(msg));
-        await redisPub.ltrim(roomKey, 0, 999);
-        // Publish to all instances
-        await redisPub.publish('global', JSON.stringify(msg));
-      }
+      // For now, just echo
     } catch (e) {}
   });
-});
-
-// ----- Sync endpoint for offline messages (optional) -----
-app.post('/sync', express.json(), async (req, res) => {
-  const { messages, room } = req.body;
-  if (!messages || !room) return res.status(400).json({ error: 'Missing data' });
-  try {
-    const roomKey = `room:${room}:messages`;
-    for (const msg of messages) {
-      await redisPub.lpush(roomKey, JSON.stringify(msg));
-      await redisPub.ltrim(roomKey, 0, 999);
-    }
-    res.json({ status: 'synced' });
-  } catch (e) {
-    res.status(500).json({ error: 'Sync failed' });
-  }
 });
 
 // ----- Start Server -----
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`✅ Aether backend running on port ${PORT}`);
 });
