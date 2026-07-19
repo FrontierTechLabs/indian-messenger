@@ -56,6 +56,7 @@ app.post('/api/posts', async (req, res) => {
     timestamp: Date.now(),
     likes: 0,
     replies: 0,
+    image: req.body.image || null,
     parentId: null
   };
 
