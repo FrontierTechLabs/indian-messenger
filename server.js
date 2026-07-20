@@ -1,256 +1,173 @@
 const express = require('express');
-const WebSocket = require('ws');
-const http = require('http');
-const Redis = require('ioredis');
-const path = require('path');
 const cors = require('cors');
-
-// ----- Redis -----
-const redisPub = new Redis({
-  host: 'prime-chamois-162864.upstash.io',
-  port: 6379,
-  password: 'gQAAAAAAAnwwAAIgcDE4NTA1NTY4ZjI4NTI0ZTVhOWEwOWY0ODc3MzJiNTA0NQ',
-  tls: {}
-});
-
-const redisSub = new Redis({
-  host: 'prime-chamois-162864.upstash.io',
-  port: 6379,
-  password: 'gQAAAAAAAnwwAAIgcDE4NTA1NTY4ZjI4NTI0ZTVhOWEwOWY0ODc3MzJiNTA0NQ',
-  tls: {}
-});
-
-// ----- Express & WebSocket -----
+const Redis = require('ioredis');
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
 app.use(cors());
-app.use(express.json());
-app.use(express.static(__dirname));
+app.use(express.json({ limit: '50mb' }));
 
-// ----- Redis Pub/Sub for cross-instance broadcast -----
-const CHANNEL = 'aether:events';
-redisSub.subscribe(CHANNEL);
-redisSub.on('message', (channel, message) => {
-  const event = JSON.parse(message);
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify({ type: 'event', event }));
+const redisPub = new Redis(process.env.REDIS_URL);
+const redisSub = new Redis(process.env.REDIS_URL);
+
+// In-memory user store (for demo)
+const users = {};        // did -> { username, did, following: [] }
+const posts = [];        // array of post objects
+const likes = {};        // postId -> Set of dids (as array)
+const comments = {};     // postId -> [ { did, username, text, timestamp } ]
+
+// ----- User registration / login (accepts username or email) -----
+app.get('/api/user/:identifier', async (req, res) => {
+  const identifier = req.params.identifier;
+  let user = null;
+  if (identifier.startsWith('did:mesh:')) {
+    user = users[identifier] || null;
+  } else {
+    for (const did in users) {
+      if (users[did].username.toLowerCase() === identifier.toLowerCase()) {
+        user = users[did];
+        break;
+      }
     }
-  });
+  }
+  if (user) {
+    res.json({ did: user.did, username: user.username });
+  } else {
+    res.status(404).json({ error: 'User not found' });
+  }
 });
 
-// ----- Helper: Get approximate city from IP (simple fallback) -----
-function getCityFromIP(req) {
-  // In production, use a geo-IP service. For now, default to "Earth"
-  return 'Earth';
-}
-
-// ----- API Endpoints -----
-
-// 1. Register / Update Username
-app.post('/api/set-username', async (req, res) => {
+app.post('/api/set-username', (req, res) => {
   const { did, username } = req.body;
-  if (!did || !username) return res.status(400).json({ error: 'Missing DID or username' });
-
-  // Check if username is already taken
-  const existing = await redisPub.get(`username:${username.toLowerCase()}`);
-  if (existing && existing !== did) {
-    return res.status(400).json({ error: 'Username already taken' });
-  }
-
-  // Store mapping: username -> DID
-  await redisPub.set(`username:${username.toLowerCase()}`, did);
-  // Store user profile
-  await redisPub.hset(`user:${did}`, 'username', username);
-  await redisPub.hset(`user:${did}`, 'city', req.body.city || 'Earth');
-  await redisPub.hset(`user:${did}`, 'displayName', username);
-
-  res.json({ success: true, username });
-});
-
-// 2. Get user profile
-app.get('/api/user/:did', async (req, res) => {
-  const did = req.params.did;
-  const data = await redisPub.hgetall(`user:${did}`);
-  if (!data || !data.username) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-  res.json({ did, ...data });
-});
-
-// 3. Search users (by username or DID)
-app.get('/api/search', async (req, res) => {
-  const q = req.query.q?.toLowerCase().trim();
-  if (!q || q.length < 2) return res.json([]);
-
-  // Search by username prefix (simple scan)
-  const keys = await redisPub.keys('username:*');
-  const results = [];
-  for (const key of keys) {
-    const username = key.replace('username:', '');
-    if (username.includes(q)) {
-      const did = await redisPub.get(key);
-      const user = await redisPub.hgetall(`user:${did}`);
-      if (user && user.username) {
-        results.push({ did, username: user.username, city: user.city || 'Earth' });
-      }
-    }
-  }
-  // Also search by DID prefix
-  const didKeys = await redisPub.keys('user:*');
-  for (const key of didKeys) {
-    const did = key.replace('user:', '');
-    if (did.includes(q)) {
-      const user = await redisPub.hgetall(key);
-      if (user && user.username && !results.find(r => r.did === did)) {
-        results.push({ did, username: user.username, city: user.city || 'Earth' });
-      }
-    }
-  }
-  res.json(results.slice(0, 20));
-});
-
-// 4. Follow / Unfollow
-app.post('/api/follow', async (req, res) => {
-  const { did, targetDid } = req.body;
-  if (!did || !targetDid) return res.status(400).json({ error: 'Missing did or targetDid' });
-  if (did === targetDid) return res.status(400).json({ error: 'Cannot follow yourself' });
-
-  await redisPub.sadd(`following:${did}`, targetDid);
-  await redisPub.sadd(`followers:${targetDid}`, did);
+  if (!did || !username) return res.status(400).json({ error: 'Missing fields' });
+  if (users[did]) return res.status(409).json({ error: 'DID already registered' });
+  users[did] = { did, username, following: [] };
   res.json({ success: true });
 });
 
-app.post('/api/unfollow', async (req, res) => {
+// ----- Follow / Unfollow -----
+app.post('/api/follow', (req, res) => {
   const { did, targetDid } = req.body;
-  if (!did || !targetDid) return res.status(400).json({ error: 'Missing did or targetDid' });
-
-  await redisPub.srem(`following:${did}`, targetDid);
-  await redisPub.srem(`followers:${targetDid}`, did);
+  if (!users[did] || !users[targetDid]) return res.status(404).json({ error: 'User not found' });
+  if (!users[did].following.includes(targetDid)) {
+    users[did].following.push(targetDid);
+  }
   res.json({ success: true });
 });
 
-app.get('/api/following/:did', async (req, res) => {
-  const did = req.params.did;
-  const following = await redisPub.smembers(`following:${did}`);
-  res.json(following);
+app.post('/api/unfollow', (req, res) => {
+  const { did, targetDid } = req.body;
+  if (users[did]) {
+    users[did].following = users[did].following.filter(id => id !== targetDid);
+  }
+  res.json({ success: true });
 });
 
-// 5. Create a post (with username, city, timestamp)
-app.post('/api/posts', async (req, res) => {
-  const { did, text, image, location } = req.body;
-  if (!did || !text) return res.status(400).json({ error: 'Missing DID or text' });
+app.get('/api/following/:did', (req, res) => {
+  const user = users[req.params.did];
+  res.json(user ? user.following : []);
+});
 
-  // Get user profile
-  const user = await redisPub.hgetall(`user:${did}`);
-  const username = user.username || did.substring(0, 8);
-  const city = location || user.city || 'Earth';
+// ----- Search users -----
+app.get('/api/search', (req, res) => {
+  const q = req.query.q.toLowerCase();
+  const results = Object.values(users).filter(u => u.username.toLowerCase().includes(q));
+  res.json(results);
+});
 
+// ----- Feed: only broadcast posts, filter by location -----
+app.get('/api/feed', async (req, res) => {
+  const type = req.query.type || 'all';
+  const location = req.query.location || '';
+  
+  // Get posts from Redis (aether:posts) or from in-memory fallback
+  let rawPosts = [];
+  try {
+    const raw = await redisPub.lrange('aether:posts', 0, 199);
+    rawPosts = raw.map(p => JSON.parse(p)).reverse();
+  } catch (e) {
+    // Fallback to in-memory posts if Redis fails
+    rawPosts = posts.slice().reverse();
+  }
+
+  let result = rawPosts;
+  if (type === 'broadcast') {
+    result = result.filter(p => p.type === 'broadcast');
+  } else if (type === 'social') {
+    result = result.filter(p => p.type !== 'broadcast');
+  }
+  if (location) {
+    result = result.filter(p => (p.location || '').toLowerCase().includes(location.toLowerCase()));
+  }
+  res.json(result);
+});
+
+// ----- Create a broadcast post (video) -----
+app.post('/api/posts', (req, res) => {
+  const { did, text, location, image, isVideo, videoData, type } = req.body;
+  if (!did || !users[did]) return res.status(401).json({ error: 'Invalid user' });
   const post = {
-    id: Date.now().toString(),
+    id: Date.now().toString(36) + Math.random().toString(36).substring(2, 6),
     did,
-    username,
-    text,
+    username: users[did].username,
+    text: text || '',
+    location: location || 'Earth',
     image: image || null,
-    city,
+    isVideo: isVideo || false,
+    videoData: videoData || null,
+    type: type || 'broadcast',
     timestamp: Date.now(),
     likes: 0,
-    replies: 0,
-    parentId: null
+    comments: 0
   };
-
-  await redisPub.lpush('aether:posts', JSON.stringify(post));
-  await redisPub.ltrim('aether:posts', 0, 999);
-  await redisPub.publish(CHANNEL, JSON.stringify({ type: 'new_post', post }));
+  posts.push(post);
+  likes[post.id] = [];
+  comments[post.id] = [];
+  // Also push to Redis for persistence
+  try {
+    redisPub.rpush('aether:posts', JSON.stringify(post));
+  } catch (e) {}
   res.json(post);
 });
 
-// 6. Get feed (chronological)
-app.get('/api/feed', async (req, res) => {
-  const raw = await redisPub.lrange('aether:posts', 0, 99);
-  const posts = raw.map(p => JSON.parse(p)).reverse();
-  res.json(posts);
-});
-
-// 7. Like a post
-app.post('/api/like', async (req, res) => {
+// ----- Like / Unlike -----
+app.post('/api/like', (req, res) => {
   const { postId, did } = req.body;
-  if (!postId || !did) return res.status(400).json({ error: 'Missing postId or DID' });
-
-  const raw = await redisPub.lrange('aether:posts', 0, 999);
-  let updated = false;
-  for (const item of raw) {
-    const post = JSON.parse(item);
-    if (post.id === postId) {
-      post.likes = (post.likes || 0) + 1;
-      await redisPub.lrem('aether:posts', 0, item);
-      await redisPub.rpush('aether:posts', JSON.stringify(post));
-      updated = true;
-      await redisPub.publish(CHANNEL, JSON.stringify({ type: 'like_update', postId, likes: post.likes }));
-      break;
-    }
+  const post = posts.find(p => p.id === postId);
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+  if (!likes[postId]) likes[postId] = [];
+  const idx = likes[postId].indexOf(did);
+  if (idx === -1) {
+    likes[postId].push(did);
+  } else {
+    likes[postId].splice(idx, 1);
   }
-  res.json({ success: updated });
+  post.likes = likes[postId].length;
+  res.json({ likes: post.likes, liked: idx === -1 });
 });
 
-// 8. Reply to a post
-app.post('/api/reply', async (req, res) => {
-  const { parentId, did, text } = req.body;
-  if (!parentId || !did || !text) return res.status(400).json({ error: 'Missing fields' });
-
-  const user = await redisPub.hgetall(`user:${did}`);
-  const username = user.username || did.substring(0, 8);
-  const city = user.city || 'Earth';
-
-  const reply = {
-    id: Date.now().toString(),
+// ----- Add comment -----
+app.post('/api/comment', (req, res) => {
+  const { postId, did, text } = req.body;
+  const post = posts.find(p => p.id === postId);
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+  if (!users[did]) return res.status(401).json({ error: 'Invalid user' });
+  if (!comments[postId]) comments[postId] = [];
+  const comment = {
     did,
-    username,
+    username: users[did].username,
     text,
-    image: null,
-    city,
-    timestamp: Date.now(),
-    likes: 0,
-    replies: 0,
-    parentId
+    timestamp: Date.now()
   };
-
-  await redisPub.lpush('aether:posts', JSON.stringify(reply));
-  await redisPub.ltrim('aether:posts', 0, 999);
-  await redisPub.publish(CHANNEL, JSON.stringify({ type: 'new_reply', reply }));
-  res.json(reply);
+  comments[postId].push(comment);
+  post.comments = comments[postId].length;
+  res.json({ success: true, comment });
 });
 
-// ----- WebSocket (for real-time updates) -----
-wss.on('connection', (ws) => {
-  ws.on('message', async (message) => {
-    try {
-      const data = JSON.parse(message);
-    } catch (e) {}
-  });
+app.get('/api/comments/:postId', (req, res) => {
+  res.json(comments[req.params.postId] || []);
 });
 
-// ----- Start Server -----
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`✅ Aether backend running on port ${PORT}`);
-});
+// ----- Serve static frontend (if built) -----
+app.use(express.static('../truth-broadcast/out'));
 
-// ----- Get user by username -----
-app.get('/api/user/:username', async (req, res) => {
-  const username = req.params.username.toLowerCase().trim();
-  if (!username) return res.status(400).json({ error: 'Username required' });
-
-  try {
-    const did = await redisPub.get(`username:${username}`);
-    if (!did) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    const userData = await redisPub.hgetall(`user:${did}`);
-    res.json({ did, ...userData });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Truth Broadcast backend on port ${PORT}`));
