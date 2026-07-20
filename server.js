@@ -237,3 +237,20 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`✅ Aether backend running on port ${PORT}`);
 });
+
+// ----- Get user by username -----
+app.get('/api/user/:username', async (req, res) => {
+  const username = req.params.username.toLowerCase().trim();
+  if (!username) return res.status(400).json({ error: 'Username required' });
+
+  try {
+    const did = await redisPub.get(`username:${username}`);
+    if (!did) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = await redisPub.hgetall(`user:${did}`);
+    res.json({ did, ...userData });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
